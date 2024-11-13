@@ -3,6 +3,268 @@ Import the necessary libraries
 ```{r}
 library(usethis)
 library(here)
-here()
+library(sf)
+library(tmap)
+library(raster)
+library(sp)
+library(gstat)
+library(geoR)
 ```
 
+Load in quantitative datasets
+
+```{r}
+SO2_Emissions <- read.csv(here("wk6_dataset", "US 2019 SO2 Emissions data.csv"))
+
+# inspect
+head(SO2_Emissions, 10)
+```
+
+Load in the shapefiles
+
+```{r}
+US_Nation_Border <- st_read(here("wk6_dataset", "US Nation Border.shp"))
+US_State_Border <- st_read(here("wk6_dataset", "US State Borders.shp"))
+
+# inspect
+qtm(US_Nation_Border)
+qtm(US_State_Border)
+```
+
+Data Preparation
+
+```{r}
+# coerce the spreadsheet into an sf object
+# First tell R that it's coordinates are currently in decimal degrees (i.e. WGS84) before the transformation
+SO2_Emissions_sf <- st_as_sf(SO2_Emissions, coords = c("Longitude", "Latitude"), crs = 4326)
+# now apply the transformation from WGS84 to Mercator i.e. crs = 3857
+SO2_Emissions_sf <- st_transform(SO2_Emissions_sf, 3857)
+# inspect CRS details
+st_crs(SO2_Emissions_sf)
+```
+
+Map out the points quickly
+
+```{r}
+tm_shape(US_Nation_Border) +
+  tm_polygons(alpha=0, border.col="black") +
+tm_shape(SO2_Emissions_sf) +
+  tm_dots() +
+tm_scale_bar(position = c("left", "bottom")) +
+tm_compass(position = c("right", "bottom"))
+```
+
+Plotting the Empirical Semivariogram
+
+Use the function `r variogram()` to create the object for plotting the empirical variogram
+
+```{r}
+# coerce SO2_Emissions_sf to be a 'sp' spatial dataframe object as it's variogram does not use 'sf' objects
+
+# ignore warning message
+SO2_Emissions_sf <- as(SO2_Emissions_sf, "Spatial")
+# use variogram() function to compute the semivariance with a null model Mean_SO2 as outcome
+
+SO2_emp.variogram <- variogram(Mean_SO2~1, SO2_Emissions_sf)
+# compute the object to reveal a table
+SO2_emp.variogram
+# plot
+plot(SO2_emp.variogram)
+```
+
+Plotting the Theoretical Semivariogram
+
+```{r}
+# fit exponential
+exp_SO2_emp.variogram <- fit.variogram(SO2_emp.variogram, model = vgm(65, "Exp", 1180000, 17))
+
+exp_SO2_emp.variogram
+plot(SO2_emp.variogram, exp_SO2_emp.variogram, main = "Exponential Model (Nug: 3.6, PSill: 55.9, Range: 296255m")
+```
+
+```{r}
+# fit spherical
+sph_SO2_emp.variogram <- fit.variogram(SO2_emp.variogram, model = vgm(65, "Sph", 1180000, 17))
+sph_SO2_emp.variogram
+plot(SO2_emp.variogram, sph_SO2_emp.variogram, main = "Spherical Model (Nug: 10.5, PSill: 49.6, Range: 857452m")
+```
+
+```{r}
+# fit gaussian
+gau_SO2_emp.variogram <- fit.variogram(SO2_emp.variogram, model = vgm(65, "Gau", 1180000, 17))
+gau_SO2_emp.variogram
+plot(SO2_emp.variogram, gau_SO2_emp.variogram, main = "Gaussian Model (Nug: 12.8, PSill: 39.1, Range: 244807m")
+```
+
+Which one is the best model?
+
+```{r}
+# select the best model
+best_SO2_emp.variogram <- fit.variogram(SO2_emp.variogram, model = vgm(c("Exp", "Gau", "Sph")))
+best_SO2_emp.variogram
+```
+
+Kriging Modelling
+
+Build a blank raster templte to begin with:
+
+```{r}
+RasterTemplate <- raster(SO2_Emissions_sf)
+res(RasterTemplate) <- 5000
+# declare template as a spatial grid
+grid.interpolation <- as(RasterTemplate, 'SpatialGrid')
+```
+
+Implement spatial interpolation on blank template using Kriging
+
+```{r}
+modelKrigingExp <- gstat(formula = Mean_SO2~1, locations = SO2_Emissions_sf, model = exp_SO2_emp.variogram)
+```
+
+```{r}
+# this may take roughly 5 minutes
+Kriged_SO2 <- predict(modelKrigingExp, grid.interpolation)
+```
+The above analysis produces two separate rasters: i) Predicted SO2 and ii) Variation in SO2
+
+Exporting the results as .tiff format thematics visualisation in `r tmap`
+
+
+```{r}
+# save both the prediction and variance as a multi-layer stack (a 'brick' raster):
+brickedKriged_SO2_Results <- brick(Kriged_SO2)
+```
+
+We can save them individually from the multi-layer raster as follows:
+
+```{r}
+# Separate the rasters accordingly
+exp.prediction <- raster(brickedKriged_SO2_Results, layer = 1)
+exp.variance <- raster(brickedKriged_SO2_Results, layer = 2)
+# save the output locally on your computer
+writeRaster(exp.prediction, "Predicted SO2 levels in USA.tif", format="GTiff", overwrite = TRUE)
+writeRaster(exp.variance, "Variance SO2 levels in USA.tif", format="GTiff", overwrite = TRUE)
+```
+
+Before visualising the outputs, we first need to make the values of the raster predictions made outside of US Border. For this, use the `r mask()` function
+
+```{r}
+US_Nation_Border_sp_shp <- as(US_Nation_Border, "Spatial")
+exp.prediction_masked <- mask(exp.prediction, US_Nation_Border)
+```
+
+Use `r st_bbox()` function on the `r US_Nation_Border` shape file object to get the extent of the region
+
+```{r}
+frameExtent <- st_bbox(US_Nation_Border)
+frameExtent
+```
+
+Visualise the predictions:
+
+```{r}
+tm_shape(exp.prediction_masked, bbox = frameExtent) +
+  tm_raster(title = "Predicted SO2 ppb", style = "cont", palette ="Reds") +
+tm_shape(US_State_Border) +
+  tm_polygons(alpha = 0, border.col = "black") +
+  tm_text("STUSPS", size = "AREA") +
+tm_shape(SO2_Emissions_sf) +
+  tm_dots() +
+tm_scale_bar(position = c("left", "bottom")) +
+tm_compass(position = c("right", "bottom")) +
+tm_layout(frame = FALSE, legend.title.size = 0.5, legend.text.size = 0.5, legend.position = c("right", "bottom"))
+```
+
+Reclassify the continuous values stored in the grid/pixels into discrete values using the following scheme
+
+```{r}
+# create a vector for the reclassification
+reclassifyRaster <- c(0, 1, 0,
+                      1, 5, 1,
+                      5, 10, 2,
+                      10, 15, 3,
+                      15, 20, 4,
+                      20, 30, 5,
+                      30, 40, 6,
+                      40, 70, 7)
+
+# then store the values into a matrix
+reclassifyRaster_Mat <- matrix(reclassifyRaster, ncol=3, byrow=TRUE)
+reclassifyRaster_Mat
+```
+
+Apply the matrix to the raster object to reclassify the pixels
+
+```{r}
+exp.prediction_masked_recl <- reclassify(exp.prediction_masked, reclassifyRaster_Mat)
+```
+
+Visualise the predictions
+
+```{r}
+tm_shape(exp.prediction_masked_recl, bbox = frameExtent) +
+  tm_raster(title = "Predicted SO2 ppb", style = "cat", palette = "Reds",
+            labels = c("<1.0 ppb", "1.0-4.9 ppbs",
+                       "5.0-9.9 ppbs", "10.0-14.9 ppbs",
+                       "15.0-19.9 ppbs", "20.0-29.9 ppbs",
+                       "30.0-39.9 ppbs", "+40.0 ppbs")) +
+tm_shape(US_State_Border) +
+  tm_polygons(alpha = 0, border.col = "black") +
+tm_text("STUSPS", size = "AREA") +
+tm_shape(SO2_Emissions_sf) +
+  tm_dots() +
+tm_scale_bar(position = c("left", "bottom")) +
+tm_compass(position = c("right", "bottom")) +
+tm_layout(frame = FALSE, legend.title.size = 0.5, legend.text.size = 0.5, legend.position = c("right", "bottom"))
+```
+
+You can also visualises the variance
+
+```{r}
+exp.variance_masked <- mask(exp.variance, US_Nation_Border)
+
+tm_shape(exp.variance_masked, bbox = frameExtent) +
+  tm_raster(title = "Variance SO2 ppb", style = "cont", palette = "Oranges") +
+tm_shape(US_State_Border) +
+  tm_polygons(alpha = 0, border.col = "black") +
+tm_text("STUSPS", size = "AREA") +
+tm_shape(SO2_Emissions_sf) +
+  tm_dots() +
+tm_scale_bar(position = c("left", "bottom")) +
+tm_compass(position = c("right", "bottom")) +
+tm_layout(frame = FALSE, legend.title.size = 0.5, legend.text.size = 0.5, legend.position = c("right", "bottom"))
+```
+
+Again, it will be better to reclassify the raster so we can es where the model predicts the SO2 with high and low errors
+
+```{r}
+reclassifyRaster_var <- c(0, 5, 0,
+                      5, 10, 1,
+                      10, 20, 2,
+                      20, 30, 3,
+                      30, 40, 4,
+                      40, 50, 5,
+                      50, 60, 6)
+
+reclassifyRaster_Mat_var <- matrix(reclassifyRaster_var, ncol=3, byrow=TRUE)
+reclassifyRaster_Mat_var
+```
+
+```{r}
+exp.variance_masked_recl <- reclassify(exp.variance_masked, reclassifyRaster_Mat_var)
+
+tm_shape(exp.variance_masked_recl, bbox = frameExtent) +
+  tm_raster(title = "Variance SO2 ppb", style = "cat", palette = "Oranges",
+            labels = c("<5.0 ppb", "5.0-9.9 ppbs",
+                       "10.0-19.9 ppbs", "20.0-29.9 ppbs",
+                       "30.0-39.9 ppbs", "40.0-49.9 ppbs",
+                       "+50.0 ppbs")) +
+tm_shape(US_State_Border) +
+  tm_polygons(alpha = 0, border.col = "black") +
+tm_text("STUSPS", size = "AREA") +
+tm_shape(SO2_Emissions_sf) +
+  tm_dots() +
+tm_scale_bar(position = c("left", "bottom")) +
+tm_compass(position = c("right", "bottom")) +
+tm_layout(frame = FALSE, legend.title.size = 0.5, legend.text.size = 0.5, legend.position = c("right", "bottom"))
+```
